@@ -11,13 +11,11 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strconv"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
+	"github.com/fogfish/awslog/internal/awslog"
 	"github.com/spf13/cobra"
 )
 
@@ -36,7 +34,16 @@ var latestCmd = &cobra.Command{
 	Use:   "latest",
 	Short: "execute AWS CloudWatch Log Insight Query",
 	Long: `
-executes AWS CloudWatch Log Insight Query against specified Log Group.
+The command executes AWS CloudWatch Log Insight Query against specified Log Group.
+See CloudWatch Logs Insights query syntax:
+  https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html
+
+Example query is following:
+
+fields @timestamp, @message
+| filter @message like /debug/ and ...
+| sort @timestamp desc
+| limit 20
 `,
 	Example: `
 awslog latest -g "/aws/lambda/myfun" -q query.insight -t 3h
@@ -59,74 +66,30 @@ func requiredLatestCmdKey(cmd *cobra.Command, args []string) error {
 }
 
 func latest(cmd *cobra.Command, args []string) error {
-	q, err := ioutil.ReadFile(queryFile)
+	q, err := os.ReadFile(queryFile)
 	if err != nil {
-		return fmt.Errorf("Unable to read query file %s: %w", queryFile, err)
-	}
-
-	io, err := session.NewSessionWithOptions(session.Options{
-		SharedConfigState: session.SharedConfigEnable,
-	})
-	if err != nil {
-		return fmt.Errorf("Unable to access AWS: %w", err)
+		return fmt.Errorf("unable to read query file %s: %w", queryFile, err)
 	}
 
 	sec, err := intervalInSeconds(interval)
 	if err != nil {
-		return fmt.Errorf("Unable to parse time interval: %w", err)
+		return fmt.Errorf("unable to parse time interval: %w", err)
 	}
 
-	cwlog := cloudwatchlogs.New(io)
-
-	insight, err := cwlog.StartQuery(
-		&cloudwatchlogs.StartQueryInput{
-			LogGroupName: aws.String(logGroup),
-			QueryString:  aws.String(string(q)),
-			StartTime:    aws.Int64(time.Now().Unix() - sec),
-			EndTime:      aws.Int64(time.Now().Unix()),
-		},
-	)
+	service := awslog.New(logGroup)
+	events, err := service.Query(string(q), time.Now().Add(-sec), time.Now())
 	if err != nil {
-		return fmt.Errorf("Unable to build AWS CloudWatch Log Insight query: %w", err)
+		return err
 	}
 
-	result, err := cwlog.GetQueryResults(
-		&cloudwatchlogs.GetQueryResultsInput{
-			QueryId: insight.QueryId,
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("Unable to fetch results of AWS CloudWatch Log Insight query: %w", err)
-	}
-
-	for aws.StringValue(result.Status) == "Running" {
-		time.Sleep(1 * time.Second)
-		result, err = cwlog.GetQueryResults(
-			&cloudwatchlogs.GetQueryResultsInput{
-				QueryId: insight.QueryId,
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("Unable to fetch results of AWS CloudWatch Log Insight query: %w", err)
-		}
-	}
-
-	if aws.StringValue(result.Status) != "Complete" {
-		return fmt.Errorf("Failed (%s) to execute query %+v", *result.Status, *result.Statistics)
-	}
-
-	for _, event := range result.Results {
-		for _, field := range event {
-			if aws.StringValue(field.Field) == "@message" {
-				fmt.Print(aws.StringValue(field.Value))
-			}
-		}
+	for _, evt := range events {
+		stdout(evt.Timestamp, evt.Message)
 	}
 
 	return nil
 }
 
-func intervalInSeconds(t string) (int64, error) {
+func intervalInSeconds(t string) (time.Duration, error) {
 	v, err := strconv.Atoi(t[0 : len(t)-1])
 	if err != nil {
 		return 0, err
@@ -134,13 +97,15 @@ func intervalInSeconds(t string) (int64, error) {
 
 	switch t[len(t)-1] {
 	case 's':
-		return int64(v), nil
+		return time.Duration(v) * time.Second, nil
 	case 'm':
-		return int64(v * 60), nil
+		return time.Duration(v) * time.Minute, nil
 	case 'h':
-		return int64(v * 3600), nil
+		return time.Duration(v) * time.Hour, nil
 	case 'd':
-		return int64(v * 86400), nil
+		return time.Duration(24*v) * time.Hour, nil
+	case 'w':
+		return time.Duration(7*24*v) * time.Hour, nil
 	default:
 		return 0, fmt.Errorf("time scale %s is not supported", t)
 	}
